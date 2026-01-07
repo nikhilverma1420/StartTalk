@@ -30,6 +30,8 @@ export default function App() {
     console.log(`Attempting to connect to: ${SERVER_URL}`);
     // Initialize socket connection
     socket.current = io(SERVER_URL, {
+      transports: ["websocket"],
+      upgrade: false,
       reconnectionAttempts: 5,
       timeout: 10000,
     });

@@ -1,8 +1,8 @@
 {
   "expo": {
-    "name": "app",
+    "name": "Start Hi Talk",
     "slug": "app",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -16,14 +16,21 @@
       "supportsTablet": true
     },
     "android": {
+      "usecleartexttraffic": true,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "package": "com.nikhil1420.app"
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "e876f223-b3cc-4b8c-8daf-c7f04a5d73a9"
+      }
     }
   }
 }

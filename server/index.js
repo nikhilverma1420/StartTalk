@@ -6,8 +6,10 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*", // Allow all origins for simplicity in development
-  }
+    origin: "*",
+  },
+  transports: ["websocket"],
+  allowUpgrades: false,
 });
 
 const PORT = 3000;
@@ -46,6 +48,7 @@ const matchUsers = () => {
 };
 
 io.on('connection', (socket) => {
+  console.log("CONNECTED FROM:", socket.handshake.address);
   console.log('A user connected:', socket.id);
   waitingQueue.push(socket);
   socket.emit('waiting');
@@ -127,6 +130,6 @@ io.on('connection', (socket) => {
   });
 });
 
-server.listen(PORT, () => {
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server listening on :${PORT}`);
 });
