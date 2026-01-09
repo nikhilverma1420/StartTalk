@@ -6,7 +6,6 @@ import {
   TextInput,
   Button,
   FlatList,
-  KeyboardAvoidingView,
   Platform,
   TouchableOpacity,
   Linking,
@@ -14,19 +13,34 @@ import {
   TouchableWithoutFeedback,
   PanResponder,
   Image,
+  Keyboard,
+  AppState,
 } from 'react-native';
+import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
+import { LinearGradient } from 'expo-linear-gradient';
+import * as Notifications from 'expo-notifications';
+import Constants from 'expo-constants';
 import { io } from 'socket.io-client';
 import LoadingScreen from './components/LoadingScreen';
+
+// Set notification handler for foreground
+Notifications.setNotificationHandler({
+  handleNotification: async () => ({
+    shouldShowAlert: true,
+    shouldPlaySound: true,
+    shouldSetBadge: false,
+  }),
+});
 
 
 // --- SERVER CONFIGURATION ---
 // OPTION 1: Online Server (Render) - Use this if you don't have a local backend running
-const SERVER_URL = 'https://starttalk.onrender.com';
+// const SERVER_URL = 'https://start-talk-production.up.railway.app';
 
 // OPTION 2: Local Server - Uncomment below if running backend locally
 // Android Emulator: 'http://10.0.2.2:3000' | iOS Simulator: 'http://localhost:3000'
 // Physical Device: 'http://YOUR_PC_IP_ADDRESS:3000' (e.g., 192.168.1.5:3000)
-// const SERVER_URL = 'http://10.0.2.2:3000';
+const SERVER_URL = 'http://192.168.0.122:3000';
 
 const REACTIONS = [
   { id: 1, type: 'emoji', content: '❤️' },
@@ -37,23 +51,30 @@ const REACTIONS = [
   { id: 6, type: 'emoji', content: '👎' },
 ];
 
-const SwipeableMessage = ({ children, onReply, isReacting }) => {
+const SwipeableMessage = ({ children, onReply, isReacting, isMe }) => {
   const translateX = useRef(new Animated.Value(0)).current;
 
   const panResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => false,
       onMoveShouldSetPanResponder: (_, gestureState) => {
-        // Detect horizontal swipe to the right, ignore vertical
-        return gestureState.dx > 10 && Math.abs(gestureState.dy) < 10;
+        // Detect horizontal swipe, ignore vertical
+        const isHorizontal = Math.abs(gestureState.dx) > 10 && Math.abs(gestureState.dy) < 10;
+        if (!isHorizontal) return false;
+
+        // If it's me, swipe Right to Left (dx < 0). If stranger, swipe Left to Right (dx > 0)
+        return isMe ? gestureState.dx < -10 : gestureState.dx > 10;
       },
       onPanResponderMove: (_, gestureState) => {
-        if (gestureState.dx > 0) {
+        if (isMe && gestureState.dx < 0) {
+          translateX.setValue(gestureState.dx * 0.3); // Add resistance
+        } else if (!isMe && gestureState.dx > 0) {
           translateX.setValue(gestureState.dx * 0.3); // Add resistance
         }
       },
       onPanResponderRelease: (_, gestureState) => {
-        if (gestureState.dx > 50) { // Threshold to trigger reply
+        const triggered = isMe ? gestureState.dx < -50 : gestureState.dx > 50;
+        if (triggered) { // Threshold to trigger reply
           onReply();
         }
         Animated.spring(translateX, {
@@ -83,7 +104,7 @@ const SwipeableMessage = ({ children, onReply, isReacting }) => {
   );
 };
 
-export default function App() {
+function MainApp() {
   const [isSplashVisible, setIsSplashVisible] = useState(true);
   const [status, setStatus] = useState('Connecting...');
   const [messages, setMessages] = useState([]);
@@ -91,10 +112,19 @@ export default function App() {
   const [replyTo, setReplyTo] = useState(null);
   const [activeReactionId, setActiveReactionId] = useState(null);
   const [editingMessage, setEditingMessage] = useState(null);
+  const [isPartnerTyping, setIsPartnerTyping] = useState(false);
+  const typingTimeoutRef = useRef(null);
   const inputRef = useRef(null);
   const socket = useRef(null);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const slideAnim = useRef(new Animated.Value(-250)).current;
+  const keyboardHeight = useRef(new Animated.Value(0)).current;
+  const insets = useSafeAreaInsets();
+  const [keyboardSpace, setKeyboardSpace] = useState(0);
+  const flatListRef = useRef(null);
+  const [inputBarHeight, setInputBarHeight] = useState(0);
+  const [appState, setAppState] = useState(AppState.currentState);
+  const appStateRef = useRef(AppState.currentState);
 
   useEffect(() => {
     console.log(`Attempting to connect to: ${SERVER_URL}`);
@@ -128,16 +158,34 @@ export default function App() {
 
     socket.current.on('waiting', () => {
       setStatus('Waiting for a partner...');
-      setMessages([]); // Clear previous chat
+      // Keep messages visible until new partner is found
+      setIsPartnerTyping(false);
     });
 
     socket.current.on('paired', () => {
       setStatus('Chatting with a stranger');
-      setMessages([]); // Clear previous chat
+      setIsPartnerTyping(false);
+      setMessages([{
+        id: 'system-join-' + Date.now(),
+        text: 'Stranger joined',
+        type: 'system',
+      }]);
+      // Show local notification when match found if in background
+      if (appStateRef.current === 'background') {
+        Notifications.scheduleNotificationAsync({
+          content: {
+            title: 'Match Found!',
+            body: 'You found a stranger. Come back to chat!',
+            sound: 'default',
+          },
+          trigger: { seconds: 1 },
+        }).catch(err => console.error('Error scheduling notification:', err));
+      }
     });
 
     socket.current.on('chat message', (msg) => {
       // Check if this is a reaction update sent as a message
+      setIsPartnerTyping(false); // Hide typing indicator when message received
       if (msg.type === 'reaction') {
         setMessages((prevMessages) =>
           prevMessages.map((m) =>
@@ -170,11 +218,11 @@ export default function App() {
           return prevMessages;
         }
         return [
-          { 
-            id: incomingId, // Use the ID sent by the sender
+          {
+            id: incomingId,
             text: msg.text ?? msg,
             from: 'Stranger',
-            replyTo: msg.replyTo || null, 
+            replyTo: msg.replyTo || null,
             reaction: msg.reaction || null,
           },
           ...prevMessages,
@@ -182,9 +230,24 @@ export default function App() {
       });
     });
 
+    socket.current.on('typing', () => {
+      setIsPartnerTyping(true);
+    });
+
+    socket.current.on('stop typing', () => {
+      setIsPartnerTyping(false);
+    });
+
     socket.current.on('stranger disconnected', () => {
       setStatus('Partner disconnected. Waiting again...');
-      setMessages([]);
+      setMessages((prevMessages) => 
+        prevMessages.map((msg) => 
+          msg.type === 'system' && msg.text === 'Stranger joined'
+            ? { ...msg, text: 'Stranger left' }
+            : msg
+        )
+      );
+      setIsPartnerTyping(false);
     });
 
     // Cleanup on component unmount
@@ -193,8 +256,109 @@ export default function App() {
     };
   }, []);
 
+  // Register for push notifications and send token to server
+  useEffect(() => {
+    const registerForPush = async () => {
+      if (!Constants.isDevice) {
+        console.log('Must use physical device for Push Notifications');
+        return;
+      }
+
+      const { status: existingStatus } = await Notifications.getPermissionsAsync();
+      let finalStatus = existingStatus;
+      if (existingStatus !== 'granted') {
+        const { status } = await Notifications.requestPermissionsAsync();
+        finalStatus = status;
+      }
+      if (finalStatus !== 'granted') {
+        console.log('Failed to get push token for push notification!');
+        return;
+      }
+
+      try {
+        const tokenData = await Notifications.getExpoPushTokenAsync();
+        const token = tokenData.data;
+        console.log('Obtained Expo push token:', token);
+        if (socket.current) socket.current.emit('registerPushToken', token);
+      } catch (err) {
+        console.error('Error getting push token', err);
+      }
+    };
+
+    registerForPush();
+  }, []);
+
+  // Track app foreground/background state and notify server
+  useEffect(() => {
+    const subscription = AppState.addEventListener('change', handleAppStateChange);
+    return () => subscription.remove();
+  }, []);
+
+  const handleAppStateChange = (nextAppState) => {
+    appStateRef.current = nextAppState;
+    setAppState(nextAppState);
+    const isBackground = nextAppState === 'background';
+    console.log('App state changed to:', nextAppState, '- isBackground:', isBackground);
+    if (socket.current) {
+      socket.current.emit('appState', { isBackground });
+    }
+  };
+
+  useEffect(() => {
+    const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
+    const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
+
+    const onShow = (e) => {
+      const toValue = e.endCoordinates ? e.endCoordinates.height : 250;
+      setKeyboardSpace(toValue);
+      Animated.timing(keyboardHeight, {
+        toValue,
+        duration: e.duration || 250,
+        useNativeDriver: false,
+      }).start();
+
+      // Scroll to latest messages when keyboard appears
+      setTimeout(() => {
+        try { flatListRef.current?.scrollToOffset({ offset: 0, animated: true }); } catch (err) {}
+      }, 120);
+    };
+
+    const onHide = (e) => {
+      setKeyboardSpace(0);
+      Animated.timing(keyboardHeight, {
+        toValue: 0,
+        duration: e.duration || 200,
+        useNativeDriver: false,
+      }).start();
+    };
+
+    const showSub = Keyboard.addListener(showEvent, onShow);
+    const hideSub = Keyboard.addListener(hideEvent, onHide);
+
+    return () => {
+      showSub.remove();
+      hideSub.remove();
+    };
+  }, [keyboardHeight]);
+
+  const handleTyping = (newText) => {
+    setText(newText);
+    
+    if (socket.current && status.startsWith('Chatting')) {
+      socket.current.emit('typing');
+
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
+
+      typingTimeoutRef.current = setTimeout(() => {
+        socket.current.emit('stop typing');
+      }, 2000);
+    }
+  };
+
   const sendMessage = () => {
     if (text.trim() && socket.current) {
+      socket.current.emit('stop typing');
+      if (typingTimeoutRef.current) clearTimeout(typingTimeoutRef.current);
       if (editingMessage) {
         socket.current.emit('chat message', { type: 'edit', id: editingMessage.id, text });
         setMessages((prevMessages) =>
@@ -219,6 +383,10 @@ export default function App() {
       ]); 
       setReplyTo(null);
       setText('');
+      // ensure FlatList shows the latest message
+      setTimeout(() => {
+        try { flatListRef.current?.scrollToOffset({ offset: 0, animated: true }); } catch (err) {}
+      }, 80);
       }
     }
   };
@@ -227,6 +395,7 @@ export default function App() {
     if (socket.current) {
       socket.current.emit('skip');
       setMessages([]);
+      setIsPartnerTyping(false);
       setStatus('Skipping...');
     }
   };
@@ -278,6 +447,19 @@ export default function App() {
   };
 
   const renderItem = ({ item }) => {
+    if (item.type === 'system') {
+      return (
+        <View style={styles.systemMessageContainer}>
+          <View style={[
+            styles.systemMessageBubble,
+            item.text === 'Stranger left' && { backgroundColor: '#ff4444' }
+          ]}>
+            <Text style={styles.systemMessageText}>{item.text}</Text>
+          </View>
+        </View>
+      );
+    }
+
     const isMe = item.from === 'Me';
     const isReacting = activeReactionId === item.id;
 
@@ -291,6 +473,7 @@ export default function App() {
           })
         }
         isReacting={isReacting}
+        isMe={isMe}
       >
       <TouchableOpacity
         activeOpacity={0.8}
@@ -384,11 +567,9 @@ export default function App() {
   }
 
   return (
-    <View style={{ flex: 1, backgroundColor: '#f5f5f5' }}>
-    <KeyboardAvoidingView
-      style={styles.container}
-      behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
-    >
+    <View style={{ flex: 1, backgroundColor: '#38527d' }}>
+    <View style={{ flex: 1 }}>
+    <View style={styles.topContainer}>
       <Text style={styles.status}>{status}</Text>
       <FlatList
         style={styles.messageList}
@@ -397,6 +578,8 @@ export default function App() {
         keyExtractor={(item) => item.id}
         inverted // To show latest messages at the bottom
         removeClippedSubviews={false} // Important: allows the picker to overflow visible bounds
+        ref={flatListRef}
+        contentContainerStyle={{ paddingTop: inputBarHeight + insets.bottom + keyboardSpace + 10, paddingHorizontal: 10 }}
         CellRendererComponent={({ index, children, style, ...props }) => {
           const item = messages[index];
           const isReacting = item && item.id === activeReactionId;
@@ -408,6 +591,8 @@ export default function App() {
           );
         }}
       />
+    </View>
+
       {replyTo && (
         <View style={styles.replyBar}>
           <View style={{ flex: 1 }}>
@@ -423,26 +608,45 @@ export default function App() {
         </View>
         )}
 
+      {isPartnerTyping && (
+        <Text style={styles.typingIndicator}>Stranger is typing...</Text>
+      )}
+
       {status.startsWith('Chatting') && (
-        <View style={styles.inputContainer}>
-          <TouchableOpacity onPress={skipConnection} style={styles.skipButton}>
-            <Text style={styles.buttonText}>Skip</Text>
+        <Animated.View onLayout={(e) => setInputBarHeight(e.nativeEvent.layout.height)} style={[styles.inputContainer, { position: 'absolute', left: 0, right: 0, bottom: insets.bottom, zIndex: isMenuOpen ? 1 : 9999, elevation: isMenuOpen ? 0 : 9999, transform: [{ translateY: Animated.multiply(keyboardHeight, -1) }] }]}>
+          <TouchableOpacity onPress={skipConnection}>
+            <LinearGradient
+              colors={['#c279fe', '#b762fe']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={styles.skipButton}
+            >
+              <Text style={styles.buttonText}>Skip</Text>
+            </LinearGradient>
           </TouchableOpacity>
           <TextInput
             ref={inputRef}
             style={styles.input}
             value={text}
-            onChangeText={setText}
+            onChangeText={handleTyping}
             placeholder="Type a message..."
             onSubmitEditing={sendMessage}
             returnKeyType="send"
+            blurOnSubmit={false}
           />
-          <TouchableOpacity onPress={sendMessage} style={styles.sendButton}>
-            <Text style={styles.buttonText}>{editingMessage ? 'Update' : 'Send'}</Text>
+          <TouchableOpacity onPress={sendMessage}>
+            <LinearGradient
+              colors={['#69bbff', '#4eafff']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={styles.sendButton}
+            >
+              <Text style={styles.buttonText}>{editingMessage ? 'Update' : 'Send'}</Text>
+            </LinearGradient>
           </TouchableOpacity>
-        </View>
+        </Animated.View>
       )}
-    </KeyboardAvoidingView>
+    </View>
 
     <TouchableOpacity style={styles.menuIcon} onPress={toggleMenu}>
       <Text style={styles.menuIconText}>☰</Text>
@@ -476,19 +680,29 @@ export default function App() {
   );
 }
 
+export default function App() {
+  return (
+    <SafeAreaProvider>
+      <MainApp />
+    </SafeAreaProvider>
+  );
+}
+
 const styles = StyleSheet.create({
-  container: {
+  topContainer: {
     flex: 1,
-    backgroundColor: '#f5f5f5',
+    backgroundColor: 'transparent',
     paddingTop: 40, // Add padding for status bar
-    paddingBottom: 10,
-    paddingHorizontal: 10,
   },
   status: {
     fontSize: 18,
     textAlign: 'center',
     paddingVertical: 10,
-    color: '#666',
+    color: '#fff',
+    fontWeight: 'bold',
+    textShadowColor: '#000',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 3,
   },
   messageList: {
     flex: 1,
@@ -510,15 +724,19 @@ const styles = StyleSheet.create({
     maxWidth: '80%',
   },
   myBubble: {
-    backgroundColor: '#007AFF', // Modern Blue
+    backgroundColor: '#fff',
     borderBottomRightRadius: 4,
+    borderWidth: 3,
+    borderColor: '#4eafff',
   },
   theirBubble: {
-    backgroundColor: '#E5E5EA', // Light Gray
+    backgroundColor: '#fff',
     borderBottomLeftRadius: 4,
+    borderWidth: 5,
+    borderColor: '#ccc',
   },
   myText: {
-    color: '#fff',
+    color: '#000',
     fontSize: 16,
   },
   theirText: {
@@ -527,35 +745,49 @@ const styles = StyleSheet.create({
   },
   inputContainer: {
     flexDirection: 'row',
-    padding: 10,
-    backgroundColor: '#fff',
+    paddingHorizontal: 10,
+    paddingTop: 0,
+    paddingBottom: 0,
+    backgroundColor: 'transparent',
     alignItems: 'center',
   },
   input: {
     flex: 1,
-    backgroundColor: '#f0f0f0',
+    backgroundColor: '#fff',
     borderRadius: 20,
     paddingHorizontal: 15,
     paddingVertical: 10,
     marginRight: 10,
     fontSize: 16,
+    borderWidth: 2,
+    borderColor: '#4eafff',
   },
   skipButton: {
-    backgroundColor: '#FF3B30',
-    paddingVertical: 10,
+    paddingVertical: 8,
     paddingHorizontal: 15,
     borderRadius: 20,
     marginRight: 10,
   },
   sendButton: {
-    backgroundColor: '#007AFF',
-    paddingVertical: 10,
+    paddingVertical: 8,
     paddingHorizontal: 15,
     borderRadius: 20,
+    shadowColor: "#000",
+    shadowOffset: {
+      width: 0,
+      height: 2,
+    },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
   },
   buttonText: {
     color: '#fff',
     fontWeight: 'bold',
+    fontSize: 18,
+    textShadowColor: '#000',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 3,
   },
   privacyContainer: {
     position: 'absolute',
@@ -574,7 +806,11 @@ const styles = StyleSheet.create({
   },
   menuIconText: {
     fontSize: 30,
-    color: '#333',
+    color: '#fff',
+    fontWeight: 'bold',
+    textShadowColor: '#000',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 3,
   },
   menuOverlay: {
     position: 'absolute',
@@ -583,7 +819,7 @@ const styles = StyleSheet.create({
     left: 0,
     right: 0,
     backgroundColor: 'rgba(0,0,0,0.5)',
-    zIndex: 100,
+    zIndex: 99998,
   },
   sideMenu: {
     position: 'absolute',
@@ -592,7 +828,7 @@ const styles = StyleSheet.create({
     left: 0,
     width: 250,
     backgroundColor: '#fff',
-    zIndex: 101,
+    zIndex: 99999,
     paddingTop: 60,
     paddingHorizontal: 20,
     shadowColor: "#000",
@@ -602,7 +838,7 @@ const styles = StyleSheet.create({
     },
     shadowOpacity: 0.25,
     shadowRadius: 3.84,
-    elevation: 5,
+    elevation: 99999,
   },
   menuTitle: {
     fontSize: 24,
@@ -721,5 +957,34 @@ const styles = StyleSheet.create({
   reactionBadgeImage: {
     width: 14,
     height: 14,
+  },
+  systemMessageContainer: {
+    alignItems: 'center',
+    marginVertical: 10,
+    width: '100%',
+  },
+  systemMessageBubble: {
+    backgroundColor: '#4ef892',
+    paddingVertical: 8,
+    paddingHorizontal: 15,
+    borderRadius: 4,
+  },
+  systemMessageText: {
+    color: '#fff',
+    fontWeight: 'bold',
+    fontSize: 16,
+    textShadowColor: '#000',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 3,
+  },
+  typingIndicator: {
+    color: '#fff',
+    fontSize: 12,
+    marginLeft: 20,
+    marginBottom: 5,
+    fontStyle: 'italic',
+    textShadowColor: '#000',
+    textShadowOffset: { width: 0, height: 0 },
+    textShadowRadius: 3,
   },
 });

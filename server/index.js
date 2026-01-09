@@ -12,6 +12,36 @@ const io = new Server(server, {
   allowUpgrades: false,
 });
 
+const fetch = require('node-fetch');
+
+// Helper to send an Expo push notification
+const sendExpoPush = async (expoPushToken, title, body, data = {}) => {
+  if (!expoPushToken) return;
+  const message = {
+    to: expoPushToken,
+    sound: 'default',
+    title,
+    body,
+    data,
+  };
+
+  try {
+    const res = await fetch('https://exp.host/--/api/v2/push/send', {
+      method: 'POST',
+      headers: {
+        'Accept': 'application/json',
+        'Accept-encoding': 'gzip, deflate',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(message),
+    });
+    const json = await res.json();
+    console.log('Expo push response:', json);
+  } catch (err) {
+    console.error('Failed to send Expo push:', err);
+  }
+};
+
 const PORT = process.env.PORT || 3000;
 
 
@@ -44,6 +74,15 @@ const matchUsers = () => {
 
     // Notify both users they are paired
     io.to(room).emit('paired');
+    
+    // Send push notification to both users if they are backgrounded
+    if (user1.expoPushToken && user1.isBackground) {
+      sendExpoPush(user1.expoPushToken, 'Found a Stranger!', 'A stranger is waiting. Come back to chat!', { type: 'paired' });
+    }
+    if (user2.expoPushToken && user2.isBackground) {
+      sendExpoPush(user2.expoPushToken, 'Found a Stranger!', 'A stranger is waiting. Come back to chat!', { type: 'paired' });
+    }
+    
     console.log(`Paired ${user1.id} and ${user2.id} in room ${room}`);
   }
 };
@@ -59,6 +98,46 @@ io.on('connection', (socket) => {
   socket.on('chat message', (msg) => {
     if (socket.room) {
       socket.to(socket.room).emit('chat message', msg);
+
+      // Try to notify the partner via push if they have registered a token and are backgrounded
+      try {
+        const partnerId = socket.partner;
+        if (partnerId) {
+          const partnerSocket = io.sockets.sockets.get(partnerId);
+          if (partnerSocket && partnerSocket.expoPushToken && partnerSocket.isBackground) {
+            const title = 'New message';
+            const body = typeof msg === 'string' ? msg : (msg.text || 'You have a new message');
+            sendExpoPush(partnerSocket.expoPushToken, title, body, { type: 'chat', from: socket.id });
+          }
+        }
+      } catch (err) {
+        console.error('Error sending push to partner:', err);
+      }
+    }
+  });
+
+  // Track app state (foreground/background)
+  socket.on('appState', (data) => {
+    socket.isBackground = data.isBackground;
+    console.log('User', socket.id, 'app state:', data.isBackground ? 'background' : 'foreground');
+  });
+
+  // Allow clients to register their Expo push token
+  socket.on('registerPushToken', (token) => {
+    console.log('Register push token for', socket.id, token);
+    socket.expoPushToken = token;
+  });
+
+  // Handle typing status
+  socket.on('typing', () => {
+    if (socket.room) {
+      socket.to(socket.room).emit('typing');
+    }
+  });
+
+  socket.on('stop typing', () => {
+    if (socket.room) {
+      socket.to(socket.room).emit('stop typing');
     }
   });
 
