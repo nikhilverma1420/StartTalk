@@ -35,12 +35,12 @@ Notifications.setNotificationHandler({
 
 // --- SERVER CONFIGURATION ---
 // OPTION 1: Online Server (Render) - Use this if you don't have a local backend running
-// const SERVER_URL = 'https://start-talk-production.up.railway.app';
+const SERVER_URL = 'https://start-talk-production.up.railway.app';
 
 // OPTION 2: Local Server - Uncomment below if running backend locally
 // Android Emulator: 'http://10.0.2.2:3000' | iOS Simulator: 'http://localhost:3000'
 // Physical Device: 'http://YOUR_PC_IP_ADDRESS:3000' (e.g., 192.168.1.5:3000)
-const SERVER_URL = 'http://192.168.0.122:3000';
+//const SERVER_URL = 'http://192.168.0.122:3000';
 
 const REACTIONS = [
   { id: 1, type: 'emoji', content: '❤️' },
