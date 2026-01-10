@@ -1,6 +1,9 @@
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+require('dotenv').config();
+const mongoose = require('mongoose');
+const chatManager = require('./chatManager');
 
 const app = express();
 const server = http.createServer(app);
@@ -44,75 +47,107 @@ const sendExpoPush = async (expoPushToken, title, body, data = {}) => {
 
 const PORT = process.env.PORT || 3000;
 
+// Connect to MongoDB
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB connection error:', err));
 
-let waitingQueue = [];
+// User schema with TTL index
+const userSchema = new mongoose.Schema({
+  userId: { type: String, unique: true, required: true },
+  expoPushToken: { type: String },
+  isOnline: { type: Boolean, default: false },
+  currentChatId: { type: String },
+  updatedAt: { type: Date, default: Date.now }
+});
+userSchema.index({ updatedAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 });
+const User = mongoose.model('User', userSchema);
 
-const matchUsers = () => {
-  // Filter out disconnected users to prevent ghost matches
-  waitingQueue = waitingQueue.filter(s => s.connected);
+// Init chat manager
+chatManager.init(User, io);
 
-  while (waitingQueue.length >= 2) {
-    const user1 = waitingQueue.shift();
-    const user2 = waitingQueue.shift();
+// Init chat manager
+chatManager.init(User, io);
 
-    // Prevent self-matching (sanity check)
-    if (user1.id === user2.id) {
-      waitingQueue.push(user1);
-      continue;
-    }
-
-    // Create a private room for the pair
-    const room = `${user1.id}#${user2.id}`;
-    user1.join(room);
-    user2.join(room);
-
-    // Store partner and room info on each socket
-    user1.room = room;
-    user2.room = room;
-    user1.partner = user2.id;
-    user2.partner = user1.id;
-
-    // Notify both users they are paired
-    io.to(room).emit('paired');
-    
-    // Send push notification to both users if they are backgrounded
-    if (user1.expoPushToken && user1.isBackground) {
-      sendExpoPush(user1.expoPushToken, 'Found a Stranger!', 'A stranger is waiting. Come back to chat!', { type: 'paired' });
-    }
-    if (user2.expoPushToken && user2.isBackground) {
-      sendExpoPush(user2.expoPushToken, 'Found a Stranger!', 'A stranger is waiting. Come back to chat!', { type: 'paired' });
-    }
-    
-    console.log(`Paired ${user1.id} and ${user2.id} in room ${room}`);
-  }
-};
 
 io.on('connection', (socket) => {
   console.log("CONNECTED FROM:", socket.handshake.address);
   console.log('A user connected:', socket.id);
-  waitingQueue.push(socket);
-  socket.emit('waiting');
-  matchUsers();
+
+  socket.on('findPartner', () => {
+    if (!chatManager.waitingQueue.find(s => s.id === socket.id)) {
+      chatManager.waitingQueue.push(socket);
+      socket.emit('waiting');
+      chatManager.matchUsers();
+    }
+  });
+
+  // Register user with push token
+  socket.on('register', async (data) => {
+    try {
+      const { userId, expoPushToken } = data;
+      await User.findOneAndUpdate(
+        { userId },
+        { expoPushToken, isOnline: true, updatedAt: new Date() },
+        { upsert: true, new: true }
+      );
+      socket.userId = userId;
+      console.log(`User ${userId} registered`);
+    } catch (err) {
+      console.error('Error registering user:', err);
+    }
+  });
+
+  // Rejoin chat
+  socket.on('rejoin', (data) => {
+    chatManager.handleRejoin(socket, data.chatId);
+  });
 
   // Handle incoming chat messages
-  socket.on('chat message', (msg) => {
+  socket.on('chat message', async (msg) => {
     if (socket.room) {
       socket.to(socket.room).emit('chat message', msg);
+      chatManager.saveMessage(socket.room, msg);
 
-      // Try to notify the partner via push if they have registered a token and are backgrounded
+      // Check if partner needs a push notification
       try {
-        const partnerId = socket.partner;
-        if (partnerId) {
-          const partnerSocket = io.sockets.sockets.get(partnerId);
-          if (partnerSocket && partnerSocket.expoPushToken && partnerSocket.isBackground) {
+        // We cannot rely solely on socket.partner because if they disconnected, that socket ID is invalid.
+        // We look up the partner via the User model using the currentChatId.
+        const partnerUser = await User.findOne({ 
+          currentChatId: socket.room, 
+          userId: { $ne: socket.userId } // Find the user who is NOT me
+        });
+
+        if (partnerUser) {
+          let shouldSendPush = false;
+
+          // 1. Partner is offline (disconnected)
+          if (!partnerUser.isOnline) {
+            shouldSendPush = true;
+          } 
+          // 2. Partner is online but in background
+          else {
+            // Check activeChats to find their socket object
+            const chat = chatManager.activeChats.get(socket.room);
+            const partnerSocket = chat?.users.find(u => u.userId === partnerUser.userId);
+            
+            // If socket is marked as background, or if we can't find the socket despite DB saying online
+            if (partnerSocket?.isBackground || !partnerSocket) {
+              shouldSendPush = true;
+            }
+          }
+
+          if (shouldSendPush) {
             const title = 'New message';
             const body = typeof msg === 'string' ? msg : (msg.text || 'You have a new message');
-            sendExpoPush(partnerSocket.expoPushToken, title, body, { type: 'chat', from: socket.id });
+            sendExpoPush(partnerUser.expoPushToken, title, body, { type: 'chat', from: socket.id, chatId: socket.room });
           }
         }
       } catch (err) {
         console.error('Error sending push to partner:', err);
       }
+    } else {
+      console.warn(`Socket ${socket.id} sent message but has no room! Message not saved.`);
     }
   });
 
@@ -143,70 +178,27 @@ io.on('connection', (socket) => {
 
   // Handle skip
   socket.on('skip', () => {
-    console.log('User skipped:', socket.id);
-
-    const partnerId = socket.partner;
-    const roomId = socket.room;
-
-    // 1. Handle the partner (if any)
-    if (partnerId) {
-      const partnerSocket = io.sockets.sockets.get(partnerId);
-      if (partnerSocket) {
-        // Notify and reset partner
-        partnerSocket.emit('stranger disconnected');
-        partnerSocket.leave(roomId);
-        delete partnerSocket.partner;
-        delete partnerSocket.room;
-
-        // Put partner back in queue (if not already there)
-        if (!waitingQueue.find(s => s.id === partnerSocket.id)) {
-          waitingQueue.push(partnerSocket);
-          partnerSocket.emit('waiting');
-        }
-      }
-    }
-
-    // 2. Reset the skipper (current user)
-    socket.leave(roomId);
-    delete socket.partner;
-    delete socket.room;
-
-    // Put skipper back in queue (ensure no duplicates)
-    if (!waitingQueue.find(s => s.id === socket.id)) {
-      waitingQueue.push(socket);
-    }
-    socket.emit('waiting');
-    
-    matchUsers();
+    chatManager.handleSkip(socket);
   });
 
   // Handle user disconnection
-  socket.on('disconnect', () => {
+  socket.on('disconnect', async () => {
     console.log('A user disconnected:', socket.id);
     
-    // If the user was in a pair
-    if (socket.partner) {
-      const partnerSocket = io.sockets.sockets.get(socket.partner);
-      if (partnerSocket) {
-        // Notify the partner
-        partnerSocket.emit('stranger disconnected');
-        
-        // Clean up partner's state and put them back in the queue
-        partnerSocket.leave(socket.room);
-        delete partnerSocket.partner;
-        delete partnerSocket.room;
-        
-        if (!waitingQueue.find(s => s.id === partnerSocket.id)) {
-          waitingQueue.push(partnerSocket);
-          partnerSocket.emit('waiting');
-          console.log(`User ${partnerSocket.id} is back in the queue.`);
-        }
-        matchUsers();
+    // Handle chat disconnect
+    chatManager.handleDisconnect(socket);
+    
+    // Update online status in DB
+    if (socket.userId) {
+      try {
+        await User.findOneAndUpdate(
+          { userId: socket.userId },
+          { isOnline: false, updatedAt: new Date() }
+        );
+      } catch (err) {
+        console.error('Error updating user offline:', err);
       }
     }
-
-    // Clean up queue if the disconnecting user was waiting
-    waitingQueue = waitingQueue.filter(s => s.id !== socket.id);
   });
 });
 

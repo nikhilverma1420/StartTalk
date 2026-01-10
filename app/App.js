@@ -18,6 +18,7 @@ import {
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import Constants from 'expo-constants';
 import { io } from 'socket.io-client';
@@ -35,12 +36,12 @@ Notifications.setNotificationHandler({
 
 // --- SERVER CONFIGURATION ---
 // OPTION 1: Online Server (Render) - Use this if you don't have a local backend running
-const SERVER_URL = 'https://start-talk-production.up.railway.app';
+//const SERVER_URL = 'https://start-talk-production.up.railway.app';
 
 // OPTION 2: Local Server - Uncomment below if running backend locally
 // Android Emulator: 'http://10.0.2.2:3000' | iOS Simulator: 'http://localhost:3000'
 // Physical Device: 'http://YOUR_PC_IP_ADDRESS:3000' (e.g., 192.168.1.5:3000)
-//const SERVER_URL = 'http://192.168.0.122:3000';
+const SERVER_URL = 'http://192.168.0.122:3000';
 
 const REACTIONS = [
   { id: 1, type: 'emoji', content: '❤️' },
@@ -116,6 +117,10 @@ function MainApp() {
   const typingTimeoutRef = useRef(null);
   const inputRef = useRef(null);
   const socket = useRef(null);
+  const [userId, setUserId] = useState('');
+  const [chatId, setChatId] = useState(null);
+  const userIdRef = useRef('');
+  const chatIdRef = useRef(null);
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const slideAnim = useRef(new Animated.Value(-250)).current;
   const keyboardHeight = useRef(new Animated.Value(0)).current;
@@ -125,9 +130,44 @@ function MainApp() {
   const [inputBarHeight, setInputBarHeight] = useState(0);
   const [appState, setAppState] = useState(AppState.currentState);
   const appStateRef = useRef(AppState.currentState);
+  const [isPartnerPaused, setIsPartnerPaused] = useState(false);
+  const [pauseCountdown, setPauseCountdown] = useState(0);
 
   useEffect(() => {
     console.log(`Attempting to connect to: ${SERVER_URL}`);
+    const loadUserId = async () => {
+      try {
+        let id = await AsyncStorage.getItem('userId');
+        if (!id) {
+          id = Math.random().toString(36).substr(2, 9);
+          await AsyncStorage.setItem('userId', id);
+        }
+        setUserId(id);
+        userIdRef.current = id;
+      } catch (err) {
+        console.error('Error loading userId:', err);
+        const id = Math.random().toString(36).substr(2, 9);
+        setUserId(id);
+        userIdRef.current = id;
+      }
+    };
+    const loadChatId = async () => {
+      try {
+        const stored = await AsyncStorage.getItem('chatId');
+        if (stored) {
+          setChatId(stored);
+          chatIdRef.current = stored;
+          // If socket connected before storage loaded, emit rejoin now
+          if (socket.current && socket.current.connected) {
+            socket.current.emit('rejoin', { chatId: stored });
+          }
+        }
+      } catch (err) {
+        console.error('Error loading chatId:', err);
+      }
+    };
+    loadUserId();
+    loadChatId();
     // Initialize socket connection
     socket.current = io(SERVER_URL, {
       transports: ["websocket"],
@@ -138,7 +178,11 @@ function MainApp() {
 
     socket.current.on('connect', () => {
       console.log('Connected to server!');
-      // The server will send 'waiting' or 'paired' next
+      if (chatIdRef.current) {
+        socket.current.emit('rejoin', { chatId: chatIdRef.current });
+      } else {
+        socket.current.emit('findPartner');
+      }
     });
 
     socket.current.on('connect_error', (err) => {
@@ -162,7 +206,7 @@ function MainApp() {
       setIsPartnerTyping(false);
     });
 
-    socket.current.on('paired', () => {
+    socket.current.on('paired', (data) => {
       setStatus('Chatting with a stranger');
       setIsPartnerTyping(false);
       setMessages([{
@@ -170,6 +214,11 @@ function MainApp() {
         text: 'Stranger joined',
         type: 'system',
       }]);
+      if (data && data.chatId) {
+        setChatId(data.chatId);
+        AsyncStorage.setItem('chatId', data.chatId).catch(err => console.error('Error saving chatId:', err));
+        chatIdRef.current = data.chatId;
+      }
       // Show local notification when match found if in background
       if (appStateRef.current === 'background') {
         Notifications.scheduleNotificationAsync({
@@ -181,6 +230,47 @@ function MainApp() {
           trigger: { seconds: 1 },
         }).catch(err => console.error('Error scheduling notification:', err));
       }
+    });
+
+    socket.current.on('partner paused', (data) => {
+      setStatus('Stranger is offline');
+      setIsPartnerPaused(true);
+      setPauseCountdown(Math.floor(data.timeout / 1000));
+    });
+
+    socket.current.on('partner rejoined', () => {
+      setStatus('Chatting with a stranger');
+      setIsPartnerPaused(false);
+      setPauseCountdown(0);
+    });
+
+    socket.current.on('rejoined', (data) => {
+      setStatus('Chatting with a stranger');
+      setIsPartnerTyping(false);
+      if (data && data.chatId) {
+        setChatId(data.chatId);
+        AsyncStorage.setItem('chatId', data.chatId).catch(err => console.error('Error saving chatId:', err));
+        chatIdRef.current = data.chatId;
+      }
+    });
+
+    socket.current.on('rejoin failed', () => {
+      setChatId(null);
+      chatIdRef.current = null;
+      AsyncStorage.removeItem('chatId').catch(err => console.error('Error removing chatId:', err));
+      setStatus('Waiting for a partner...');
+      socket.current.emit('findPartner');
+    });
+
+    socket.current.on('chat history', (history) => {
+      const formattedMessages = history.map(msg => ({
+        id: msg.id,
+        text: msg.text,
+        userId: msg.userId, // Store userId directly
+        replyTo: msg.replyTo,
+        reaction: msg.reaction
+      })).reverse();
+      setMessages(formattedMessages);
     });
 
     socket.current.on('chat message', (msg) => {
@@ -221,7 +311,7 @@ function MainApp() {
           {
             id: incomingId,
             text: msg.text ?? msg,
-            from: 'Stranger',
+            userId: msg.userId, // Store userId directly
             replyTo: msg.replyTo || null,
             reaction: msg.reaction || null,
           },
@@ -248,6 +338,10 @@ function MainApp() {
         )
       );
       setIsPartnerTyping(false);
+      setIsPartnerPaused(false);
+      setChatId(null);
+      chatIdRef.current = null;
+      AsyncStorage.removeItem('chatId').catch(err => console.error('Error removing chatId:', err));
     });
 
     // Cleanup on component unmount
@@ -255,6 +349,17 @@ function MainApp() {
       socket.current.disconnect();
     };
   }, []);
+
+  // Countdown timer for paused partner
+  useEffect(() => {
+    let interval;
+    if (isPartnerPaused && pauseCountdown > 0) {
+      interval = setInterval(() => {
+        setPauseCountdown((prev) => prev > 0 ? prev - 1 : 0);
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [isPartnerPaused, pauseCountdown]);
 
   // Register for push notifications and send token to server
   useEffect(() => {
@@ -279,7 +384,7 @@ function MainApp() {
         const tokenData = await Notifications.getExpoPushTokenAsync();
         const token = tokenData.data;
         console.log('Obtained Expo push token:', token);
-        if (socket.current) socket.current.emit('registerPushToken', token);
+        if (socket.current) socket.current.emit('register', { userId, expoPushToken: token });
       } catch (err) {
         console.error('Error getting push token', err);
       }
@@ -370,13 +475,13 @@ function MainApp() {
         setText('');
       } else {
       const messageId = Date.now().toString(); // Generate ID here
-      const messageData = { id: messageId, text, replyTo }; // Send ID to server
+      const messageData = { id: messageId, text, replyTo, userId: userIdRef.current }; // Send ID to server
       socket.current.emit('chat message', messageData);
       setMessages((prevMessages) => [
         {
           id: messageId,
           text,
-          from: 'Me',
+          userId: userId, // Use state userId
           replyTo,
         },
         ...prevMessages,
@@ -396,6 +501,7 @@ function MainApp() {
       socket.current.emit('skip');
       setMessages([]);
       setIsPartnerTyping(false);
+      setIsPartnerPaused(false);
       setStatus('Skipping...');
     }
   };
@@ -460,7 +566,7 @@ function MainApp() {
       );
     }
 
-    const isMe = item.from === 'Me';
+    const isMe = item.userId === userId; // Determine ownership at render time
     const isReacting = activeReactionId === item.id;
 
     return (
@@ -469,7 +575,7 @@ function MainApp() {
           setReplyTo({
             id: item.id,
             text: item.text,
-            from: item.from,
+            userId: item.userId,
           })
         }
         isReacting={isReacting}
@@ -513,7 +619,7 @@ function MainApp() {
             {item.replyTo && (
               <View style={styles.replyPreview}>
                 <Text style={styles.replySender}>
-                  {item.replyTo.from === 'Me' ? 'You' : 'Stranger'}
+                  {item.replyTo.userId === userId ? 'You' : 'Stranger'}
                 </Text>
                 <Text style={styles.replyText} numberOfLines={1}>
                   {item.replyTo.text}
@@ -593,57 +699,72 @@ function MainApp() {
       />
     </View>
 
-      {replyTo && (
-        <View style={styles.replyBar}>
-          <View style={{ flex: 1 }}>
-            <Text style={styles.replyingTo}>
-              Replying to {replyTo.from === 'Me' ? 'You' : 'Stranger'}
-            </Text>
-            <Text numberOfLines={1}>{replyTo.text}</Text>
+      {isPartnerPaused && (
+        <View style={styles.pausedContainer}>
+          <Text style={styles.pausedText}>Stranger is offline</Text>
+          <Text style={styles.pausedSubText}>Room closes in {Math.floor(pauseCountdown / 60)}:{(pauseCountdown % 60).toString().padStart(2, '0')}</Text>
+          <View style={styles.pausedButtons}>
+             <TouchableOpacity style={styles.waitButton} onPress={() => setIsPartnerPaused(false)}>
+                <Text style={styles.buttonText}>Wait</Text>
+             </TouchableOpacity>
+             <TouchableOpacity style={styles.skipButtonPaused} onPress={skipConnection}>
+                <Text style={styles.buttonText}>Skip</Text>
+             </TouchableOpacity>
           </View>
-
-          <TouchableOpacity onPress={() => setReplyTo(null)}>
-            <Text style={styles.closeReply}>✕</Text>
-          </TouchableOpacity>
         </View>
-        )}
-
-      {isPartnerTyping && (
-        <Text style={styles.typingIndicator}>Stranger is typing...</Text>
       )}
 
-      {status.startsWith('Chatting') && (
-        <Animated.View onLayout={(e) => setInputBarHeight(e.nativeEvent.layout.height)} style={[styles.inputContainer, { position: 'absolute', left: 0, right: 0, bottom: insets.bottom, zIndex: isMenuOpen ? 1 : 9999, elevation: isMenuOpen ? 0 : 9999, transform: [{ translateY: Animated.multiply(keyboardHeight, -1) }] }]}>
-          <TouchableOpacity onPress={skipConnection}>
-            <LinearGradient
-              colors={['#c279fe', '#b762fe']}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-              style={styles.skipButton}
-            >
-              <Text style={styles.buttonText}>Skip</Text>
-            </LinearGradient>
-          </TouchableOpacity>
-          <TextInput
-            ref={inputRef}
-            style={styles.input}
-            value={text}
-            onChangeText={handleTyping}
-            placeholder="Type a message..."
-            onSubmitEditing={sendMessage}
-            returnKeyType="send"
-            blurOnSubmit={false}
-          />
-          <TouchableOpacity onPress={sendMessage}>
-            <LinearGradient
-              colors={['#69bbff', '#4eafff']}
-              start={{ x: 0, y: 0 }}
-              end={{ x: 1, y: 1 }}
-              style={styles.sendButton}
-            >
-              <Text style={styles.buttonText}>{editingMessage ? 'Update' : 'Send'}</Text>
-            </LinearGradient>
-          </TouchableOpacity>
+      {(status.startsWith('Chatting') || status === 'Stranger is offline') && (
+        <Animated.View onLayout={(e) => setInputBarHeight(e.nativeEvent.layout.height)} style={{ flexDirection: 'column', position: 'absolute', left: 0, right: 0, bottom: insets.bottom, zIndex: isMenuOpen ? 1 : 9999, elevation: isMenuOpen ? 0 : 9999, transform: [{ translateY: Animated.multiply(keyboardHeight, -1) }] }}>
+          {replyTo && (
+            <View style={styles.replyBar}>
+              <View style={{ flex: 1 }}>
+                <Text style={styles.replyingTo}>
+                  Replying to {replyTo.userId === userId ? 'You' : 'Stranger'}
+                </Text>
+                <Text numberOfLines={1}>{replyTo.text}</Text>
+              </View>
+
+              <TouchableOpacity onPress={() => setReplyTo(null)}>
+                <Text style={styles.closeReply}>✕</Text>
+              </TouchableOpacity>
+            </View>
+          )}
+          {isPartnerTyping && (
+            <Text style={styles.typingIndicator}>Stranger is typing...</Text>
+          )}
+          <View style={styles.inputContainer}>
+            <TouchableOpacity onPress={skipConnection}>
+              <LinearGradient
+                colors={['#c279fe', '#b762fe']}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 1, y: 1 }}
+                style={styles.skipButton}
+              >
+                <Text style={styles.buttonText}>Skip</Text>
+              </LinearGradient>
+            </TouchableOpacity>
+            <TextInput
+              ref={inputRef}
+              style={styles.input}
+              value={text}
+              onChangeText={handleTyping}
+              placeholder="Type a message..."
+              onSubmitEditing={sendMessage}
+              returnKeyType="send"
+              blurOnSubmit={false}
+            />
+            <TouchableOpacity onPress={sendMessage}>
+              <LinearGradient
+                colors={['#69bbff', '#4eafff']}
+                start={{ x: 0, y: 0 }}
+                end={{ x: 1, y: 1 }}
+                style={styles.sendButton}
+              >
+                <Text style={styles.buttonText}>{editingMessage ? 'Update' : 'Send'}</Text>
+              </LinearGradient>
+            </TouchableOpacity>
+          </View>
         </Animated.View>
       )}
     </View>
@@ -986,5 +1107,49 @@ const styles = StyleSheet.create({
     textShadowColor: '#000',
     textShadowOffset: { width: 0, height: 0 },
     textShadowRadius: 3,
+  },
+  pausedContainer: {
+    position: 'absolute',
+    top: '40%',
+    alignSelf: 'center',
+    backgroundColor: 'rgba(0,0,0,0.9)',
+    padding: 20,
+    borderRadius: 15,
+    alignItems: 'center',
+    zIndex: 10000,
+    width: '80%',
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.25,
+    shadowRadius: 3.84,
+    elevation: 5,
+  },
+  pausedText: {
+    color: '#fff',
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 5,
+  },
+  pausedSubText: {
+    color: '#ccc',
+    fontSize: 14,
+    marginBottom: 20,
+  },
+  pausedButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-around',
+    width: '100%',
+  },
+  waitButton: {
+    backgroundColor: '#4eafff',
+    paddingVertical: 10,
+    paddingHorizontal: 30,
+    borderRadius: 20,
+  },
+  skipButtonPaused: {
+    backgroundColor: '#ff4444',
+    paddingVertical: 10,
+    paddingHorizontal: 30,
+    borderRadius: 20,
   },
 });
