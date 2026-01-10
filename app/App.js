@@ -15,6 +15,7 @@ import {
   Image,
   Keyboard,
   AppState,
+  Alert,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -376,6 +377,14 @@ function MainApp() {
         finalStatus = status;
       }
       if (finalStatus !== 'granted') {
+        Alert.alert(
+          'Permission Required',
+          'Please enable notifications to receive messages from strangers when you are away.',
+          [
+            { text: 'Cancel', style: 'cancel' },
+            { text: 'Open Settings', onPress: () => Linking.openSettings() }
+          ]
+        );
         console.log('Failed to get push token for push notification!');
         return;
       }
