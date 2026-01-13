@@ -16,6 +16,7 @@ import {
   Keyboard,
   AppState,
   Alert,
+  Vibration,
 } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
@@ -37,12 +38,13 @@ Notifications.setNotificationHandler({
 
 // --- SERVER CONFIGURATION ---
 // OPTION 1: Online Server (Render) - Use this if you don't have a local backend running
-//const SERVER_URL = 'https://start-talk-production.up.railway.app';
+const SERVER_URL = 'https://start-talk-production.up.railway.app';
 
 // OPTION 2: Local Server - Uncomment below if running backend locally
 // Android Emulator: 'http://10.0.2.2:3000' | iOS Simulator: 'http://localhost:3000'
 // Physical Device: 'http://YOUR_PC_IP_ADDRESS:3000' (e.g., 192.168.1.5:3000)
-const SERVER_URL = 'http://192.168.0.122:3000';
+//const SERVER_URL = 'http://192.168.0.122:3000';
+const APP_VERSION = '1.0.1';
 
 const REACTIONS = [
   { id: 1, type: 'emoji', content: '❤️' },
@@ -133,6 +135,10 @@ function MainApp() {
   const appStateRef = useRef(AppState.currentState);
   const [isPartnerPaused, setIsPartnerPaused] = useState(false);
   const [pauseCountdown, setPauseCountdown] = useState(0);
+  const [onlineUsers, setOnlineUsers] = useState(0);
+  const [isReportVisible, setIsReportVisible] = useState(false);
+  const [reportText, setReportText] = useState('');
+  const [reports, setReports] = useState([]);
 
   useEffect(() => {
     console.log(`Attempting to connect to: ${SERVER_URL}`);
@@ -182,7 +188,7 @@ function MainApp() {
       if (chatIdRef.current) {
         socket.current.emit('rejoin', { chatId: chatIdRef.current });
       } else {
-        socket.current.emit('findPartner');
+        socket.current.emit('findPartner', { version: APP_VERSION });
       }
     });
 
@@ -208,6 +214,7 @@ function MainApp() {
     });
 
     socket.current.on('paired', (data) => {
+      Vibration.vibrate();
       setStatus('Chatting with a stranger');
       setIsPartnerTyping(false);
       setMessages([{
@@ -260,7 +267,7 @@ function MainApp() {
       chatIdRef.current = null;
       AsyncStorage.removeItem('chatId').catch(err => console.error('Error removing chatId:', err));
       setStatus('Waiting for a partner...');
-      socket.current.emit('findPartner');
+      socket.current.emit('findPartner', { version: APP_VERSION });
     });
 
     socket.current.on('chat history', (history) => {
@@ -315,6 +322,7 @@ function MainApp() {
             userId: msg.userId, // Store userId directly
             replyTo: msg.replyTo || null,
             reaction: msg.reaction || null,
+            type: msg.type,
           },
           ...prevMessages,
         ];
@@ -345,6 +353,18 @@ function MainApp() {
       AsyncStorage.removeItem('chatId').catch(err => console.error('Error removing chatId:', err));
     });
 
+    socket.current.on('onlineUsers', (count) => {
+      setOnlineUsers(count);
+    });
+
+    socket.current.on('reportsList', (data) => {
+      setReports(data);
+    });
+
+    socket.current.on('newReport', (report) => {
+      setReports((prev) => [report, ...prev]);
+    });
+
     // Cleanup on component unmount
     return () => {
       socket.current.disconnect();
@@ -364,12 +384,9 @@ function MainApp() {
 
   // Register for push notifications and send token to server
   useEffect(() => {
-    const registerForPush = async () => {
-      if (!Constants.isDevice) {
-        console.log('Must use physical device for Push Notifications');
-        return;
-      }
+    if (!userId) return;
 
+    const registerForPush = async () => {
       const { status: existingStatus } = await Notifications.getPermissionsAsync();
       let finalStatus = existingStatus;
       if (existingStatus !== 'granted') {
@@ -389,18 +406,22 @@ function MainApp() {
         return;
       }
 
-      try {
-        const tokenData = await Notifications.getExpoPushTokenAsync();
-        const token = tokenData.data;
-        console.log('Obtained Expo push token:', token);
-        if (socket.current) socket.current.emit('register', { userId, expoPushToken: token });
-      } catch (err) {
-        console.error('Error getting push token', err);
+      if (Constants.isDevice) {
+        try {
+          const tokenData = await Notifications.getExpoPushTokenAsync();
+          const token = tokenData.data;
+          console.log('Obtained Expo push token:', token);
+          if (socket.current) socket.current.emit('register', { userId, expoPushToken: token });
+        } catch (err) {
+          console.error('Error getting push token', err);
+        }
+      } else {
+        console.log('Must use physical device for Push Notifications');
       }
     };
 
     registerForPush();
-  }, []);
+  }, [userId]);
 
   // Track app foreground/background state and notify server
   useEffect(() => {
@@ -502,6 +523,24 @@ function MainApp() {
         try { flatListRef.current?.scrollToOffset({ offset: 0, animated: true }); } catch (err) {}
       }, 80);
       }
+    }
+  };
+
+  const openReportWindow = () => {
+    setIsMenuOpen(false);
+    setIsReportVisible(true);
+    if (socket.current) {
+      socket.current.emit('fetchReports');
+    }
+  };
+
+  const submitReport = () => {
+    if (reportText.trim()) {
+      if (socket.current) {
+        socket.current.emit('submitReport', reportText);
+      }
+      setReportText('');
+      Keyboard.dismiss();
     }
   };
 
@@ -681,11 +720,53 @@ function MainApp() {
     );
   }
 
+  if (isReportVisible) {
+    return (
+      <View style={styles.reportContainer}>
+        <View style={styles.reportHeader}>
+          <Text style={styles.reportTitle}>Report a Problem</Text>
+          <TouchableOpacity onPress={() => setIsReportVisible(false)} style={styles.closeButton}>
+            <Text style={styles.closeButtonText}>Close</Text>
+          </TouchableOpacity>
+        </View>
+        <TextInput
+          style={styles.reportInput}
+          placeholder="Describe the problem here..."
+          placeholderTextColor="#999"
+          multiline
+          value={reportText}
+          onChangeText={setReportText}
+        />
+        <TouchableOpacity style={styles.submitReportButton} onPress={submitReport}>
+          <Text style={styles.buttonText}>Submit Report</Text>
+        </TouchableOpacity>
+        
+        <Text style={styles.recentReportsTitle}>Recent Reports:</Text>
+        <FlatList
+          data={reports}
+          keyExtractor={(item) => item._id || Math.random().toString()}
+          renderItem={({ item }) => (
+            <View style={styles.reportItem}>
+              <Text style={styles.reportItemText}>{item.text}</Text>
+            </View>
+          )}
+          style={{ flex: 1 }}
+        />
+      </View>
+    );
+  }
+
   return (
     <View style={{ flex: 1, backgroundColor: '#38527d' }}>
     <View style={{ flex: 1 }}>
     <View style={styles.topContainer}>
-      <Text style={styles.status}>{status}</Text>
+      <View style={styles.headerWrapper}>
+        <Text style={styles.status}>{status}</Text>
+        <View style={styles.onlineBadge}>
+          <View style={styles.onlineDot} />
+          <Text style={styles.onlineCount}>{onlineUsers}</Text>
+        </View>
+      </View>
       <FlatList
         style={styles.messageList}
         data={messages}
@@ -805,6 +886,9 @@ function MainApp() {
       }}>
         <Text style={styles.menuItem}>Terms of use</Text>
       </TouchableOpacity>
+      <TouchableOpacity onPress={openReportWindow}>
+        <Text style={styles.menuItem}>Report a Problem</Text>
+      </TouchableOpacity>
     </Animated.View>
     </View>
   );
@@ -833,6 +917,34 @@ const styles = StyleSheet.create({
     textShadowColor: '#000',
     textShadowOffset: { width: 0, height: 0 },
     textShadowRadius: 3,
+  },
+  headerWrapper: {
+    position: 'relative',
+    justifyContent: 'center',
+    alignItems: 'center',
+    width: '100%',
+  },
+  onlineBadge: {
+    position: 'absolute',
+    right: 20,
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.2)',
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  onlineDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#4ef892',
+    marginRight: 6,
+  },
+  onlineCount: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 'bold',
   },
   messageList: {
     flex: 1,
@@ -1160,5 +1272,66 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     paddingHorizontal: 30,
     borderRadius: 20,
+  },
+  reportContainer: {
+    flex: 1,
+    backgroundColor: '#f5f5f5',
+    paddingTop: 50,
+    paddingHorizontal: 20,
+  },
+  reportHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  reportTitle: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    color: '#333',
+  },
+  closeButton: {
+    padding: 10,
+  },
+  closeButtonText: {
+    fontSize: 18,
+    color: '#007AFF',
+  },
+  reportInput: {
+    backgroundColor: '#fff',
+    borderRadius: 10,
+    padding: 15,
+    height: 150,
+    textAlignVertical: 'top',
+    fontSize: 16,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#ddd',
+    color: '#000',
+  },
+  submitReportButton: {
+    backgroundColor: '#4eafff',
+    padding: 15,
+    borderRadius: 10,
+    alignItems: 'center',
+    marginBottom: 20,
+  },
+  recentReportsTitle: {
+    fontSize: 18,
+    fontWeight: 'bold',
+    marginBottom: 10,
+    color: '#333',
+  },
+  reportItem: {
+    backgroundColor: '#fff',
+    padding: 15,
+    borderRadius: 10,
+    marginBottom: 10,
+    borderWidth: 1,
+    borderColor: '#eee',
+  },
+  reportItemText: {
+    fontSize: 14,
+    color: '#333',
   },
 });

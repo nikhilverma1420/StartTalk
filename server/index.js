@@ -63,6 +63,13 @@ const userSchema = new mongoose.Schema({
 userSchema.index({ updatedAt: 1 }, { expireAfterSeconds: 7 * 24 * 60 * 60 });
 const User = mongoose.model('User', userSchema);
 
+// Report Schema (Anonymous)
+const reportSchema = new mongoose.Schema({
+  text: { type: String, required: true },
+  createdAt: { type: Date, default: Date.now }
+});
+const Report = mongoose.model('Report', reportSchema);
+
 // Init chat manager
 chatManager.init(User, io);
 
@@ -73,9 +80,33 @@ chatManager.init(User, io);
 io.on('connection', (socket) => {
   console.log("CONNECTED FROM:", socket.handshake.address);
   console.log('A user connected:', socket.id);
+  io.emit('onlineUsers', io.engine.clientsCount);
 
-  socket.on('findPartner', () => {
+  // Report listeners
+  socket.on('fetchReports', async () => {
+    try {
+      const reports = await Report.find().sort({ createdAt: -1 }).limit(100);
+      socket.emit('reportsList', reports);
+    } catch (err) {
+      console.error('Error fetching reports:', err);
+    }
+  });
+
+  socket.on('submitReport', async (text) => {
+    if (text && typeof text === 'string' && text.trim().length > 0) {
+      try {
+        const newReport = new Report({ text: text.trim() });
+        await newReport.save();
+        io.emit('newReport', newReport);
+      } catch (err) {
+        console.error('Error saving report:', err);
+      }
+    }
+  });
+
+  socket.on('findPartner', (data) => {
     if (!chatManager.waitingQueue.find(s => s.id === socket.id)) {
+      socket.appVersion = data?.version || '0.0.0';
       chatManager.waitingQueue.push(socket);
       socket.emit('waiting');
       chatManager.matchUsers();
@@ -120,10 +151,12 @@ io.on('connection', (socket) => {
 
         if (partnerUser) {
           let shouldSendPush = false;
+          let pushReason = '';
 
           // 1. Partner is offline (disconnected)
           if (!partnerUser.isOnline) {
             shouldSendPush = true;
+            pushReason = 'Partner is Offline';
           } 
           // 2. Partner is online but in background
           else {
@@ -132,15 +165,22 @@ io.on('connection', (socket) => {
             const partnerSocket = chat?.users.find(u => u.userId === partnerUser.userId);
             
             // If socket is marked as background, or if we can't find the socket despite DB saying online
-            if (partnerSocket?.isBackground || !partnerSocket) {
+            if (partnerSocket?.isBackground) {
               shouldSendPush = true;
+              pushReason = 'Partner is in Background';
+            } else if (!partnerSocket) {
+              shouldSendPush = true;
+              pushReason = 'Partner socket not found';
             }
           }
 
           if (shouldSendPush) {
+            console.log(`[PUSH LOGIC] Sending notification to ${partnerUser.userId}. Reason: ${pushReason}`);
             const title = 'New message';
             const body = typeof msg === 'string' ? msg : (msg.text || 'You have a new message');
             sendExpoPush(partnerUser.expoPushToken, title, body, { type: 'chat', from: socket.id, chatId: socket.room });
+          } else {
+            console.log(`[PUSH LOGIC] Skipped notification for ${partnerUser.userId}. User is Online & Foreground.`);
           }
         }
       } catch (err) {
@@ -199,6 +239,7 @@ io.on('connection', (socket) => {
         console.error('Error updating user offline:', err);
       }
     }
+    io.emit('onlineUsers', io.engine.clientsCount);
   });
 });
 

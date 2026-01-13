@@ -15,6 +15,18 @@ function generateChatId() {
   return uuidv4();
 }
 
+function compareVersions(v1, v2) {
+  const p1 = v1.split('.').map(Number);
+  const p2 = v2.split('.').map(Number);
+  for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
+    const n1 = p1[i] || 0;
+    const n2 = p2[i] || 0;
+    if (n1 > n2) return 1;
+    if (n2 > n1) return -1;
+  }
+  return 0;
+}
+
 function matchUsers() {
   console.log('matchUsers called, waitingQueue length:', waitingQueue.length);
   // Filter out disconnected users
@@ -48,6 +60,25 @@ function matchUsers() {
 
     user1.emit('paired', { chatId });
     user2.emit('paired', { chatId });
+
+    // Check versions and notify if update is needed
+    const v1 = user1.appVersion || '0.0.0';
+    const v2 = user2.appVersion || '0.0.0';
+
+    if (compareVersions(v1, v2) < 0) {
+      user1.emit('chat message', { 
+        type: 'system', 
+        text: '⚠️ New version available! Please update your app to get the latest features.',
+        id: 'sys-ver-' + Date.now()
+      });
+    }
+    if (compareVersions(v2, v1) < 0) {
+      user2.emit('chat message', { 
+        type: 'system', 
+        text: '⚠️ New version available! Please update your app to get the latest features.',
+        id: 'sys-ver-' + Date.now()
+      });
+    }
 
     console.log(`Paired ${user1.id} and ${user2.id} in room ${roomId}`);
   }
